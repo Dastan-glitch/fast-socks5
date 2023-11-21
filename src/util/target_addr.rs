@@ -1,15 +1,15 @@
 use crate::consts;
 use crate::consts::SOCKS5_ADDR_TYPE_IPV4;
 use crate::read_exact;
+use crate::util::lookup_host;
 use crate::SocksError;
 use anyhow::Context;
+use smol::io::{AsyncRead, AsyncReadExt};
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::vec::IntoIter;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::net::lookup_host;
 
 /// SOCKS5 reply code
 #[derive(Error, Debug)]
@@ -69,10 +69,7 @@ impl TargetAddr {
     }
 
     pub fn is_ip(&self) -> bool {
-        match self {
-            TargetAddr::Ip(_) => true,
-            _ => false,
-        }
+        matches!(self, TargetAddr::Ip(_))
     }
 
     pub fn is_domain(&self) -> bool {

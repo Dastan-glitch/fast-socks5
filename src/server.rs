@@ -7,6 +7,15 @@ use crate::util::target_addr::{read_address, TargetAddr};
 use crate::Socks5Command;
 use crate::{consts, AuthenticationMethod, ReplyError, Result, SocksError};
 use anyhow::Context;
+use async_std::net::TcpListener;
+use async_std::net::TcpStream;
+use async_std::net::ToSocketAddrs;
+use async_std::net::UdpSocket;
+use async_std::stream::Stream;
+use futures::future::Either;
+use futures::try_join;
+use smol::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use smol::net::AsyncToSocketAddrs;
 use std::future::Future;
 use std::io;
 use std::net::IpAddr;
@@ -16,11 +25,6 @@ use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as AsyncContext, Poll};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::UdpSocket;
-use tokio::net::{TcpListener, TcpStream, ToSocketAddrs as AsyncToSocketAddrs};
-use tokio::try_join;
-use tokio_stream::Stream;
 
 #[derive(Clone)]
 pub struct Config<A: Authentication = DenyAuthentication> {
@@ -189,7 +193,7 @@ pub struct Socks5Server<A: Authentication = DenyAuthentication> {
 }
 
 impl<A: Authentication + Default> Socks5Server<A> {
-    pub async fn bind<S: AsyncToSocketAddrs>(addr: S) -> io::Result<Self> {
+    pub async fn bind<S: AsyncToSocketAddrs + ToSocketAddrs>(addr: S) -> io::Result<Self> {
         let listener = TcpListener::bind(&addr).await?;
         let config = Arc::new(Config::default());
 
@@ -502,16 +506,16 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
 
             info!("User logged successfully.");
 
-            return Ok(credentials);
+            Ok(credentials)
         } else {
             self.inner
                 .write_all(&[1, consts::SOCKS5_AUTH_METHOD_NOT_ACCEPTABLE])
                 .await
                 .context("Can't reply with auth method not acceptable.")?;
 
-            return Err(SocksError::AuthenticationRejected(format!(
-                "Authentication, rejected."
-            )));
+            Err(SocksError::AuthenticationRejected(
+                "Authentication, rejected.".to_string(),
+            ))
         }
     }
 
@@ -630,10 +634,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
             None => Err(ReplyError::CommandNotSupported.into()),
             Some(cmd) => match cmd {
                 Socks5Command::TCPBind => Err(ReplyError::CommandNotSupported.into()),
-                Socks5Command::TCPConnect => return self.execute_command_connect().await,
+                Socks5Command::TCPConnect => self.execute_command_connect().await,
                 Socks5Command::UDPAssociate => {
                     if self.config.allow_udp {
-                        return self.execute_command_udp_assoc().await;
+                        self.execute_command_udp_assoc().await
                     } else {
                         Err(ReplyError::CommandNotSupported.into())
                     }
@@ -734,14 +738,38 @@ impl<T: AsyncRead + AsyncWrite + Unpin, A: Authentication> Socks5Socket<T, A> {
 
 /// Copy data between two peers
 /// Using 2 different generators, because they could be different structs with same traits.
-async fn transfer<I, O>(mut inbound: I, mut outbound: O) -> Result<()>
+async fn transfer<I, O>(mut inbound: I, outbound: O) -> Result<()>
 where
     I: AsyncRead + AsyncWrite + Unpin,
     O: AsyncRead + AsyncWrite + Unpin,
 {
-    match tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await {
-        Ok(res) => info!("transfer closed ({}, {})", res.0, res.1),
-        Err(err) => error!("transfer error: {:?}", err),
+    //TODO: use TcpStream.clone() https://github.com/async-rs/async-std/pull/689/files#diff-633608b66cafdfb86435918f3a48bea5R17
+
+    //    let (mut ri, mut wi) = (&inbound, &inbound);
+    let (mut ri, mut wi) = futures::io::AsyncReadExt::split(&mut inbound);
+    //    let (mut ro, mut wo) = (&outbound, &outbound);
+    let (mut ro, mut wo) = futures::io::AsyncReadExt::split(outbound);
+
+    // Exchange data
+    // For some reasons, futures::future::select does not work with async_std::io::copy() 🤔
+    let inbound_to_outbound = futures::io::copy(&mut ri, &mut wo);
+    let outbound_to_inbound = futures::io::copy(&mut ro, &mut wi);
+
+    // I've chosen `select` over `join` because the inbound (client) is more likely to leave the connection open for a while,
+    // while it's not necessarily as the other part (outbound, aka remote server) has closed the communication.
+    match futures::future::select(inbound_to_outbound, outbound_to_inbound).await {
+        Either::Left((Ok(data), _)) => {
+            info!("local closed -> remote target ({} bytes consumed)", data)
+        }
+        Either::Left((Err(err), _)) => {
+            error!("local closed -> remote target with error {:?}", err,)
+        }
+        Either::Right((Ok(data), _)) => {
+            info!("local <- remote target closed ({} bytes consumed)", data)
+        }
+        Either::Right((Err(err), _)) => {
+            error!("local <- remote target closed with error {:?}", err,)
+        }
     };
 
     Ok(())
@@ -813,8 +841,8 @@ where
     fn poll_read(
         mut self: Pin<&mut Self>,
         context: &mut std::task::Context,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.inner).poll_read(context, buf)
     }
 }
@@ -839,11 +867,15 @@ where
         Pin::new(&mut self.inner).poll_flush(context)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        context: &mut std::task::Context,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(context)
+    // fn poll_shutdown(
+    //     mut self: Pin<&mut Self>,
+    //     context: &mut std::task::Context,
+    // ) -> Poll<io::Result<()>> {
+    //     Pin::new(&mut self.inner).poll_shutdown(context)
+    // }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut AsyncContext<'_>) -> Poll<io::Result<()>> {
+        todo!()
     }
 }
 
@@ -876,8 +908,9 @@ fn new_reply(error: &ReplyError, sock_addr: SocketAddr) -> Vec<u8> {
 
 #[cfg(test)]
 mod test {
+    use smol::future::block_on;
+
     use crate::server::Socks5Server;
-    use tokio_test::block_on;
 
     use super::AcceptAuthentication;
 

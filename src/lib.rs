@@ -10,14 +10,13 @@ pub mod util;
 pub mod socks4;
 
 use anyhow::Context;
+use smol::io::AsyncReadExt;
 use std::fmt;
 use std::io;
 use thiserror::Error;
 use util::target_addr::read_address;
 use util::target_addr::TargetAddr;
 use util::target_addr::ToTargetAddr;
-
-use tokio::io::AsyncReadExt;
 
 #[rustfmt::skip]
 pub mod consts {
@@ -261,7 +260,7 @@ pub fn new_udp_header<T: ToTargetAddr>(target_addr: T) -> Result<Vec<u8>> {
 }
 
 /// Parse data from UDP client on raw buffer, return (frag, target_addr, payload).
-pub async fn parse_udp_request<'a>(mut req: &'a [u8]) -> Result<(u8, TargetAddr, &'a [u8])> {
+pub async fn parse_udp_request(mut req: &[u8]) -> Result<(u8, TargetAddr, &[u8])> {
     let rsv = read_exact!(req, [0u8; 2]).context("Malformed request")?;
 
     if !rsv.eq(&[0u8; 2]) {
@@ -283,9 +282,14 @@ pub async fn parse_udp_request<'a>(mut req: &'a [u8]) -> Result<(u8, TargetAddr,
 #[cfg(test)]
 mod test {
     use anyhow::Result;
-    use tokio::{
+    use async_std::{
+        channel::Sender,
         net::{TcpListener, TcpStream, UdpSocket},
-        sync::oneshot::Sender,
+        task,
+    };
+    use smol::{
+        block_on,
+        io::{AsyncReadExt, AsyncWriteExt},
     };
 
     use crate::{
@@ -297,9 +301,6 @@ mod test {
         num::ParseIntError,
         sync::Arc,
     };
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::oneshot;
-    use tokio_test::block_on;
 
     fn init() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -319,7 +320,7 @@ mod test {
 
         let config = Arc::new(config);
         let listener = TcpListener::bind(proxy_addr).await?;
-        tx.send(listener.local_addr()?).unwrap();
+        let _ = tx.send(listener.local_addr()?).await;
         loop {
             let (stream, _) = listener.accept().await?;
             let mut socks5_socket = server::Socks5Socket::new(stream, config.clone());
@@ -345,11 +346,11 @@ mod test {
     fn google_no_auth() {
         init();
         block_on(async {
-            let (tx, rx) = oneshot::channel();
-            tokio::spawn(setup_socks_server("[::1]:0", None, tx));
+            let (tx, rx) = smol::channel::unbounded();
+            task::spawn(setup_socks_server("[::1]:0", None, tx));
 
             let socket = client::Socks5Stream::connect(
-                rx.await.unwrap(),
+                rx.recv().await.unwrap(),
                 "google.com".to_owned(),
                 80,
                 client::Config::default(),
@@ -366,9 +367,10 @@ mod test {
         block_on(async {
             const MOCK_ADDRESS: &str = "[::1]:40235";
 
-            let (tx, rx) = oneshot::channel();
-            tokio::spawn(setup_socks_server("[::1]:0", None, tx));
-            let backing_socket = TcpStream::connect(rx.await.unwrap()).await.unwrap();
+            // let (tx, rx) = oneshot::channel();
+            let (tx, rx) = smol::channel::unbounded();
+            task::spawn(setup_socks_server("[::1]:0", None, tx));
+            let backing_socket = TcpStream::connect(rx.recv().await.unwrap()).await.unwrap();
 
             // Creates a UDP tunnel which can be used to forward UDP packets, "[::]:0" indicates the
             // binding source address used to communicate with the socks5 server.
@@ -409,9 +411,9 @@ mod test {
         block_on(async {
             const DNS_SERVER: &str = "1.1.1.1:53";
 
-            let (tx, rx) = oneshot::channel();
-            tokio::spawn(setup_socks_server("[::1]:0", None, tx));
-            let backing_socket = TcpStream::connect(rx.await.unwrap()).await.unwrap();
+            let (tx, rx) = smol::channel::unbounded();
+            task::spawn(setup_socks_server("[::1]:0", None, tx));
+            let backing_socket = TcpStream::connect(rx.recv().await.unwrap()).await.unwrap();
 
             // Creates a UDP tunnel which can be used to forward UDP packets, "[::]:0" indicates the
             // binding source address used to communicate with the socks5 server.

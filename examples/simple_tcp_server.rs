@@ -1,19 +1,15 @@
-#[forbid(unsafe_code)]
 #[macro_use]
 extern crate log;
 
+use async_std::{net::TcpListener, task};
 use fast_socks5::{
     server::{Authentication, Config, SimpleUserPassword, Socks5Socket},
     Result,
 };
+use futures::{AsyncRead, AsyncWrite};
 use std::future::Future;
 use std::sync::Arc;
 use structopt::StructOpt;
-use tokio::task;
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    net::TcpListener,
-};
 
 /// # How to use it:
 ///
@@ -64,7 +60,7 @@ enum AuthMode {
 /// TODO: Write functional tests: https://github.com/ark0f/async-socks5/blob/master/src/lib.rs#L762
 /// TODO: Write functional tests with cURL?
 /// TODO: Move this to as a standalone library
-#[tokio::main]
+#[async_std::main]
 async fn main() -> Result<()> {
     env_logger::init();
 

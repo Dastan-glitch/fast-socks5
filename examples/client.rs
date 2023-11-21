@@ -1,12 +1,11 @@
-#[forbid(unsafe_code)]
 #[macro_use]
 extern crate log;
 
 use anyhow::Context;
 use fast_socks5::client::Config;
 use fast_socks5::{client::Socks5Stream, Result};
+use smol::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use structopt::StructOpt;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// # How to use it:
 ///
@@ -45,7 +44,7 @@ struct Opt {
     pub skip_auth: bool,
 }
 
-#[tokio::main]
+#[async_std::main]
 async fn main() -> Result<()> {
     env_logger::init();
 
